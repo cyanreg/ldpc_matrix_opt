@@ -39,6 +39,9 @@ typedef struct MainContext {
     int message_bits;
     int parity_bits;
     int rows_at_once;
+    size_t mat_size;
+
+    AVBufferRef *mat_ref;
 } MainContext;
 
 typedef struct ShaderContext {
@@ -46,7 +49,6 @@ typedef struct ShaderContext {
     FFVkSPIRVShader shd;
 
     AVBufferPool *msg_pool;
-    AVBufferPool *matrix_pool;
 } ShaderContext;
 
 static int init_vulkan(MainContext *ctx)
@@ -112,6 +114,8 @@ static int init_vulkan(MainContext *ctx)
 typedef struct ECShaderPush {
     VkDeviceAddress mat;
     VkDeviceAddress msg;
+    uint32_t rand_seed;
+    int num_err;
 } ECShaderPush;
 
 static int init_ec_shader(MainContext *ctx, ShaderContext *sc)
@@ -143,6 +147,8 @@ static int init_ec_shader(MainContext *ctx, ShaderContext *sc)
     GLSLC(0, layout(push_constant, std430) uniform pushConstants {                       );
     GLSLC(1,     MatrixBuffer mat_base;                                                  );
     GLSLC(1,     OctetBuffer msg_base;                                                   );
+    GLSLC(1,     uint32_t rand_seed;                                                     );
+    GLSLC(1,     int num_err;                                                            );
     GLSLC(0, };                                                                          );
     GLSLC(0,                                                                             );
 
@@ -186,48 +192,53 @@ static int init_ec_shader(MainContext *ctx, ShaderContext *sc)
     if (spv_opaque)
         ctx->spv->free_shader(ctx->spv, &spv_opaque);
 
+    err = ff_vk_create_avbuf(&ctx->s, &ctx->mat_ref, ctx->mat_size,
+                             NULL, NULL,
+                             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                             VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+                             VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT |
+                             VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT);
+    if (err < 0) {
+        printf("Error allocating buffer: %s\n", av_err2str(err));
+        return err;
+    }
+
+    FFVkBuffer *mat_vk = (FFVkBuffer *)ctx->mat_ref->data;
+    err = ff_vk_map_buffer(&ctx->s, mat_vk, &mat_vk->mapped_mem, 0);
+    if (err < 0) {
+        printf("Error mapping buffer: %s\n", av_err2str(err));
+        return err;
+    }
+
     return 0;
 }
 
-static int run_ec_shader(MainContext *ctx, ShaderContext *sc)
+static int run_ec_shader(MainContext *ctx, ShaderContext *sc, int num_err)
 {
     int err;
     FFVulkanFunctions *vk = &ctx->s.vkfn;
+    AVBufferRef *mat_ref = ctx->mat_ref;
+    FFVkBuffer *mat_vk = (FFVkBuffer *)mat_ref->data;
 
     AVBufferRef *msg_ref;
     err = ff_vk_get_pooled_buffer(&ctx->s, &sc->msg_pool, &msg_ref,
                                   VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
                                   VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
                                   NULL,
-                                  (ctx->message_bits + ctx->parity_bits)/8,
+                                  (2*ctx->message_bits + ctx->parity_bits)/8,
                                   VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
     if (err < 0) {
         printf("Error allocating memory: %s\n", av_err2str(err));
         return err;
     }
-
-    AVBufferRef *mat_ref;
-    size_t mat_size;
-    mat_size = (ctx->message_bits + ctx->parity_bits)*ctx->parity_bits;
-    mat_size /= ctx->rows_at_once;
-    mat_size *= (ctx->rows_at_once >> 3);
-    err = ff_vk_get_pooled_buffer(&ctx->s, &sc->matrix_pool, &mat_ref,
-                                  VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
-                                  VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
-                                  NULL,
-                                  mat_size,
-                                  VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-    if (err < 0) {
-        printf("Error allocating memory: %s\n", av_err2str(err));
-        return err;
-    }
+    FFVkBuffer *msg_vk = (FFVkBuffer *)msg_ref->data;
 
     FFVkExecContext *exec = ff_vk_exec_get(&ctx->exec_pool);
     ff_vk_exec_start(&ctx->s, exec);
 
     ff_vk_exec_bind_pipeline(&ctx->s, exec, &sc->pl);
 
-    err = ff_vk_exec_add_dep_buf(&ctx->s, exec, &mat_ref, 1, 0);
+    err = ff_vk_exec_add_dep_buf(&ctx->s, exec, &mat_ref, 1, 1);
     if (err < 0) {
         printf("Error adding buffer dep: %s\n", av_err2str(err));
         return err;
@@ -239,12 +250,11 @@ static int run_ec_shader(MainContext *ctx, ShaderContext *sc)
         return err;
     }
 
-    FFVkBuffer *mat_vk = (FFVkBuffer *)mat_ref->data;
-    FFVkBuffer *msg_vk = (FFVkBuffer *)msg_ref->data;
-
     ECShaderPush pd = {
         .mat = mat_vk->address,
         .msg = msg_vk->address,
+        .rand_seed = random(),
+        .num_err = num_err,
     };
 
     ff_vk_update_push_exec(&ctx->s, exec, &sc->pl, VK_SHADER_STAGE_COMPUTE_BIT,
@@ -252,19 +262,6 @@ static int run_ec_shader(MainContext *ctx, ShaderContext *sc)
 
     VkBufferMemoryBarrier2 buf_bar[8];
     int nb_buf_bar = 0;
-
-    buf_bar[nb_buf_bar++] = (VkBufferMemoryBarrier2) {
-        .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2,
-        .srcStageMask = mat_vk->stage,
-        .dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
-        .srcAccessMask = mat_vk->access,
-        .dstAccessMask = VK_ACCESS_2_SHADER_READ_BIT,
-        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-        .buffer = mat_vk->buf,
-        .size = mat_vk->size,
-        .offset = 0,
-    };
 
     buf_bar[nb_buf_bar++] = (VkBufferMemoryBarrier2) {
         .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2,
@@ -285,10 +282,8 @@ static int run_ec_shader(MainContext *ctx, ShaderContext *sc)
             .pBufferMemoryBarriers = buf_bar,
             .bufferMemoryBarrierCount = nb_buf_bar,
     });
-    mat_vk->stage = buf_bar[0].dstStageMask;
-    mat_vk->access = buf_bar[0].dstAccessMask;
-    msg_vk->stage = buf_bar[1].dstStageMask;
-    msg_vk->access = buf_bar[1].dstAccessMask;
+    msg_vk->stage = buf_bar[0].dstStageMask;
+    msg_vk->access = buf_bar[0].dstAccessMask;
 
     vk->CmdDispatch(exec->buf, 1, 1, 1);
 
@@ -303,13 +298,27 @@ static int run_ec_shader(MainContext *ctx, ShaderContext *sc)
     return 0;
 }
 
+static void write_ldpc(MainContext *ctx)
+{
+    FFVkBuffer *mat_vk = (FFVkBuffer *)ctx->mat_ref->data;
+
+    memset(mat_vk->mapped_mem, 0, ctx->mat_size);
+
+}
+
 int main(void)
 {
     int err;
     MainContext ctx = { };
     ctx.message_bits = 224;
     ctx.parity_bits = 64;
+//    ctx.message_bits = 2016;
+//    ctx.parity_bits = 768;
+
     ctx.rows_at_once = 64;
+    ctx.mat_size = (ctx.message_bits + ctx.parity_bits)*ctx.parity_bits;
+    ctx.mat_size /= ctx.rows_at_once;
+    ctx.mat_size *= (ctx.rows_at_once >> 3);
 
     av_log_set_level(AV_LOG_TRACE);
 
@@ -322,10 +331,12 @@ int main(void)
     if (err < 0)
         return AVERROR(err);
 
+    write_ldpc(&ctx);
+
     struct timespec ts_start, ts_end;
     clock_gettime(CLOCK_MONOTONIC_RAW, &ts_start);
 
-    err = run_ec_shader(&ctx, &sc);
+    err = run_ec_shader(&ctx, &sc, 0);
     if (err < 0)
         return AVERROR(err);
 
@@ -336,10 +347,10 @@ int main(void)
     ctx.spv->uninit(&ctx.spv);
 
     av_buffer_pool_uninit(&sc.msg_pool);
-    av_buffer_pool_uninit(&sc.matrix_pool);
     ff_vk_pipeline_free(&ctx.s, &sc.pl);
     ff_vk_shader_free(&ctx.s, &sc.shd);
 
+    av_buffer_unref(&ctx.mat_ref);
     ff_vk_uninit(&ctx.s);
     av_buffer_unref(&ctx.dev_ref);
 

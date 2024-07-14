@@ -85,6 +85,24 @@ const char *ff_vk_ret2str(VkResult res)
 #undef CASE
 }
 
+static const char *comp_to_str(VkComponentTypeKHR t)
+{
+    switch (t) {
+    case VK_COMPONENT_TYPE_FLOAT16_KHR: return "f16";
+    case VK_COMPONENT_TYPE_FLOAT32_KHR: return "f32";
+    case VK_COMPONENT_TYPE_FLOAT64_KHR: return "f64";
+    case VK_COMPONENT_TYPE_SINT8_KHR: return "i8";
+    case VK_COMPONENT_TYPE_SINT16_KHR: return "i16";
+    case VK_COMPONENT_TYPE_SINT32_KHR: return "i32";
+    case VK_COMPONENT_TYPE_SINT64_KHR: return "i64";
+    case VK_COMPONENT_TYPE_UINT8_KHR: return "u8";
+    case VK_COMPONENT_TYPE_UINT16_KHR: return "u16";
+    case VK_COMPONENT_TYPE_UINT32_KHR: return "u32";
+    case VK_COMPONENT_TYPE_UINT64_KHR: return "u64";
+    default: return "unkn";
+    }
+}
+
 int ff_vk_load_props(FFVulkanContext *s)
 {
     FFVulkanFunctions *vk = &s->vkfn;
@@ -183,6 +201,18 @@ int ff_vk_load_props(FFVulkanContext *s)
             vk->GetPhysicalDeviceCooperativeMatrixPropertiesKHR(s->hwctx->phys_dev,
                                                                 &s->coop_mat_props_nb,
                                                                 s->coop_mat_props);
+
+            av_log(s, AV_LOG_TRACE, "Cooperative matrix props:\n");
+            for (int i = 0; i < s->coop_mat_props_nb; i++) {
+                av_log(s, AV_LOG_TRACE, "    %s*%s+%s=%s, (%i, %i, %i)\n",
+                       comp_to_str(s->coop_mat_props[i].AType),
+                       comp_to_str(s->coop_mat_props[i].BType),
+                       comp_to_str(s->coop_mat_props[i].CType),
+                       comp_to_str(s->coop_mat_props[i].ResultType),
+                       s->coop_mat_props[i].MSize,
+                       s->coop_mat_props[i].NSize,
+                       s->coop_mat_props[i].KSize);
+            }
         }
     }
 
