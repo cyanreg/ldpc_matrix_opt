@@ -49,7 +49,11 @@ if glslang_dep.found() == true
     conf.set('CONFIG_LIBGLSLANG', 1)
 endif
 
-shader_files = ['ec.comp']
+shader_files = [
+    'ec.comp',
+    'bp.comp',
+    'spa.comp',
+]
 
 file2string = find_program('file2string.py')
 foreach file: shader_files

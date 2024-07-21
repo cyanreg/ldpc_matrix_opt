@@ -42,6 +42,7 @@ typedef struct MainContext {
     size_t mat_size;
 
     AVBufferRef *mat_ref;
+    AVBufferRef *err_ref;
 } MainContext;
 
 typedef struct ShaderContext {
@@ -108,6 +109,43 @@ static int init_vulkan(MainContext *ctx)
         return err;
     }
 
+    /* Matrix buffer */
+    err = ff_vk_create_avbuf(&ctx->s, &ctx->mat_ref, ctx->mat_size,
+                             NULL, NULL,
+                             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                             VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+                             VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT |
+                             VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT);
+    if (err < 0) {
+        printf("Error allocating buffer: %s\n", av_err2str(err));
+        return err;
+    }
+
+    FFVkBuffer *mat_vk = (FFVkBuffer *)ctx->mat_ref->data;
+    err = ff_vk_map_buffer(&ctx->s, mat_vk, &mat_vk->mapped_mem, 0);
+    if (err < 0) {
+        printf("Error mapping buffer: %s\n", av_err2str(err));
+        return err;
+    }
+
+    /* Error counter */
+    err = ff_vk_create_avbuf(&ctx->s, &ctx->err_ref, 4,
+                             NULL, NULL,
+                             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                             VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+                             VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT |
+                             VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT);
+    if (err < 0) {
+        printf("Error allocating buffer: %s\n", av_err2str(err));
+        return err;
+    }
+    FFVkBuffer *err_vk = (FFVkBuffer *)ctx->err_ref->data;
+    err = ff_vk_map_buffer(&ctx->s, err_vk, &err_vk->mapped_mem, 0);
+    if (err < 0) {
+        printf("Error mapping buffer: %s\n", av_err2str(err));
+        return err;
+    }
+
     return 0;
 }
 
@@ -116,6 +154,7 @@ typedef struct ECShaderPush {
     VkDeviceAddress msg;
     uint32_t rand_seed;
     int num_err;
+    int bp_iter;
 } ECShaderPush;
 
 static int init_ec_shader(MainContext *ctx, ShaderContext *sc)
@@ -149,16 +188,52 @@ static int init_ec_shader(MainContext *ctx, ShaderContext *sc)
     GLSLC(1,     OctetBuffer msg_base;                                                   );
     GLSLC(1,     uint32_t rand_seed;                                                     );
     GLSLC(1,     int num_err;                                                            );
+    GLSLC(1,     int bp_iter;                                                            );
     GLSLC(0, };                                                                          );
     GLSLC(0,                                                                             );
 
     ff_vk_add_push_constant(&sc->pl, 0, sizeof(ECShaderPush), VK_SHADER_STAGE_COMPUTE_BIT);
 
-    const char *shader_data = {
+    FFVulkanDescriptorSetBinding *desc_set = (FFVulkanDescriptorSetBinding []) {
+        {
+            .name        = "errors_acc_buf",
+            .type        = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+            .stages      = VK_SHADER_STAGE_COMPUTE_BIT,
+            .buf_content = "uint32_t errors_acc;",
+        },
+    };
+    err = ff_vk_pipeline_descriptor_set_add(&ctx->s, &sc->pl, shd,
+                                            desc_set, 1, 1, 0);
+    if (err < 0) {
+        printf("Error adding descriptor set: %s\n", av_err2str(err));
+        return err;
+    }
+
+    const char *ec_data = {
 #include "ec.comp.inc"
     };
+    GLSLD(ec_data);
 
-    GLSLD(shader_data);
+    const char *spa_data = {
+#include "spa.comp.inc"
+    };
+    GLSLD(spa_data);
+
+    const char *bp_data = {
+#include "bp.comp.inc"
+    };
+    GLSLD(bp_data);
+
+    GLSLC(0, void main()                                                                 );
+    GLSLC(0, {                                                                           );
+    GLSLC(1,     fill_buffer(msg_base);                                                  );
+    GLSLC(1,     ldpc_encode(msg_base, mat_base);                                        );
+    GLSLC(1,     damage_buffer(msg_base);                                                );
+    GLSLC(0,                                                                             );
+    GLSLC(1,     bp_decode(msg_base, mat_base);                                          );
+    GLSLC(0,                                                                             );
+    GLSLC(1,     compare_buffer(msg_base);                                               );
+    GLSLC(0, }                                                                           );
 
     uint8_t *spv_data;
     size_t spv_len;
@@ -192,21 +267,13 @@ static int init_ec_shader(MainContext *ctx, ShaderContext *sc)
     if (spv_opaque)
         ctx->spv->free_shader(ctx->spv, &spv_opaque);
 
-    err = ff_vk_create_avbuf(&ctx->s, &ctx->mat_ref, ctx->mat_size,
-                             NULL, NULL,
-                             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
-                             VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
-                             VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT |
-                             VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT);
+    /* Update descriptor */
+    FFVkBuffer *err_vk = (FFVkBuffer *)ctx->err_ref->data;
+    err = ff_vk_set_descriptor_buffer(&ctx->s, &sc->pl, NULL, 0, 0, 0,
+                                      err_vk->address, err_vk->size,
+                                      VK_FORMAT_UNDEFINED);
     if (err < 0) {
-        printf("Error allocating buffer: %s\n", av_err2str(err));
-        return err;
-    }
-
-    FFVkBuffer *mat_vk = (FFVkBuffer *)ctx->mat_ref->data;
-    err = ff_vk_map_buffer(&ctx->s, mat_vk, &mat_vk->mapped_mem, 0);
-    if (err < 0) {
-        printf("Error mapping buffer: %s\n", av_err2str(err));
+        printf("Error updating descriptor set: %s\n", av_err2str(err));
         return err;
     }
 
@@ -244,6 +311,12 @@ static int run_ec_shader(MainContext *ctx, ShaderContext *sc, int num_err)
         return err;
     }
 
+    err = ff_vk_exec_add_dep_buf(&ctx->s, exec, &ctx->err_ref, 1, 1);
+    if (err < 0) {
+        printf("Error adding buffer dep: %s\n", av_err2str(err));
+        return err;
+    }
+
     err = ff_vk_exec_add_dep_buf(&ctx->s, exec, &msg_ref, 1, 0);
     if (err < 0) {
         printf("Error adding buffer dep: %s\n", av_err2str(err));
@@ -255,11 +328,13 @@ static int run_ec_shader(MainContext *ctx, ShaderContext *sc, int num_err)
         .msg = msg_vk->address,
         .rand_seed = random(),
         .num_err = num_err,
+        .bp_iter = 1,
     };
 
     ff_vk_update_push_exec(&ctx->s, exec, &sc->pl, VK_SHADER_STAGE_COMPUTE_BIT,
                            0, sizeof(pd), &pd);
 
+#if 0
     VkBufferMemoryBarrier2 buf_bar[8];
     int nb_buf_bar = 0;
 
@@ -284,6 +359,7 @@ static int run_ec_shader(MainContext *ctx, ShaderContext *sc, int num_err)
     });
     msg_vk->stage = buf_bar[0].dstStageMask;
     msg_vk->access = buf_bar[0].dstAccessMask;
+#endif
 
     vk->CmdDispatch(exec->buf, 1, 1, 1);
 
@@ -304,6 +380,8 @@ static void write_ldpc(MainContext *ctx)
 
     memset(mat_vk->mapped_mem, 0, ctx->mat_size);
 
+    FFVkBuffer *err_vk = (FFVkBuffer *)ctx->err_ref->data;
+    memset(err_vk->mapped_mem, 0, err_vk->size);
 }
 
 int main(void)
@@ -343,6 +421,9 @@ int main(void)
     clock_gettime(CLOCK_MONOTONIC_RAW, &ts_end);
     printf("Shader done: %f ms\n", diff_timespec(&ts_end, &ts_start)*1000);
 
+    FFVkBuffer *err_vk = (FFVkBuffer *)ctx.err_ref->data;
+    printf("errors = %u\n", *((uint32_t *)err_vk->mapped_mem));
+
     ff_vk_exec_pool_free(&ctx.s, &ctx.exec_pool);
     ctx.spv->uninit(&ctx.spv);
 
@@ -351,6 +432,7 @@ int main(void)
     ff_vk_shader_free(&ctx.s, &sc.shd);
 
     av_buffer_unref(&ctx.mat_ref);
+    av_buffer_unref(&ctx.err_ref);
     ff_vk_uninit(&ctx.s);
     av_buffer_unref(&ctx.dev_ref);
 

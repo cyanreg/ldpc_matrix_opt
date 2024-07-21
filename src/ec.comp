@@ -27,10 +27,10 @@ uint32_t pcg_hash(uint32_t state)
 void fill_buffer(OctetBuffer pkt)
 {
     uint64_t dst = uint64_t(pkt);
-    uint64_t ref = uint64_t(pkt) + (message_bits >> 3) + (parity_bits >> 3);
+    uint64_t ref = uint64_t(pkt) + ((message_bits + parity_bits) >> 3);
     uint32_t state = rand_seed + gl_GlobalInvocationID.x;
 
-    for (int i = 0; i < (message_bits >> 8); i += 4) {
+    for (int i = 0; i < (message_bits >> 3); i += 4) {
         state = pcg_hash(state);
         OctetBuffer(dst).b[0] = OctetBuffer(ref).b[0] = uint8_t((state >>  0) & 0xFF);
         OctetBuffer(dst).b[1] = OctetBuffer(ref).b[1] = uint8_t((state >>  8) & 0xFF);
@@ -74,15 +74,38 @@ void ldpc_encode(OctetBuffer pkt, MatrixBuffer H)
     }
 }
 
-void damage(OctetBuffer pkt)
+void damage_buffer(OctetBuffer pkt)
 {
+    uint64_t base = uint64_t(pkt);
     uint32_t state = rand_seed + gl_GlobalInvocationID.x;
+    for (int i = 0; i < num_err; i++) {
+        state = pcg_hash(state);
+        uint32_t bit = state % (message_bits + parity_bits);
 
+        uint32_t off = state % (bit >> 3);
+        uint64_t addr = base + off;
+
+        uint32_t val = OctetBuffer(addr).b[0];
+        val ^= 1 << (bit & 0x7);
+        OctetBuffer(addr).b[0] = uint8_t(val);
+    }
 }
 
-void main()
+void compare_buffer(OctetBuffer pkt)
 {
-    fill_buffer(msg_base);
-    ldpc_encode(msg_base, mat_base);
-    damage(msg_base);
+    uint32_t errors = 0;
+    uint64_t src = uint64_t(pkt);
+    uint64_t ref = uint64_t(pkt) + ((message_bits + parity_bits) >> 3);
+    for (int i = 0; i < (message_bits >> 3); i++) {
+        uint32_t a = OctetBuffer(ref).b[0];
+        uint32_t b = OctetBuffer(src).b[0];
+        uint32_t diff = a ^ b;
+
+        errors += bitCount(diff);
+
+        ref += 1;
+        src += 1;
+    }
+
+    atomicAdd(errors_acc, errors);
 }
