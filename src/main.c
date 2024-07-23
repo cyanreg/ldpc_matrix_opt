@@ -50,6 +50,7 @@ typedef struct ShaderContext {
     FFVkSPIRVShader shd;
 
     AVBufferPool *msg_pool;
+    AVBufferPool *dec_pool;
 } ShaderContext;
 
 static int init_vulkan(MainContext *ctx)
@@ -152,6 +153,7 @@ static int init_vulkan(MainContext *ctx)
 typedef struct ECShaderPush {
     VkDeviceAddress mat;
     VkDeviceAddress msg;
+    VkDeviceAddress dec;
     uint32_t rand_seed;
     int num_err;
     int bp_iter;
@@ -172,6 +174,8 @@ static int init_ec_shader(MainContext *ctx, ShaderContext *sc)
 
     GLSLC(0, #extension GL_ARB_gpu_shader_int64 : require                                );
     GLSLC(0, #extension GL_EXT_shader_explicit_arithmetic_types : require                );
+    GLSLC(0, #extension GL_KHR_cooperative_matrix : require                              );
+    GLSLC(0, #extension GL_KHR_memory_scope_semantics : require                          );
     GLSLC(0,                                                                             );
     GLSLF(0, #define message_bits %u                                   ,ctx->message_bits);
     GLSLF(0, #define parity_bits %u                                     ,ctx->parity_bits);
@@ -186,6 +190,7 @@ static int init_ec_shader(MainContext *ctx, ShaderContext *sc)
     GLSLC(0, layout(push_constant, std430) uniform pushConstants {                       );
     GLSLC(1,     MatrixBuffer mat_base;                                                  );
     GLSLC(1,     OctetBuffer msg_base;                                                   );
+    GLSLC(1,     OctetBuffer dec_base;                                                   );
     GLSLC(1,     uint32_t rand_seed;                                                     );
     GLSLC(1,     int num_err;                                                            );
     GLSLC(1,     int bp_iter;                                                            );
@@ -300,6 +305,19 @@ static int run_ec_shader(MainContext *ctx, ShaderContext *sc, int num_err)
     }
     FFVkBuffer *msg_vk = (FFVkBuffer *)msg_ref->data;
 
+    AVBufferRef *dec_ref;
+    err = ff_vk_get_pooled_buffer(&ctx->s, &sc->dec_pool, &dec_ref,
+                                  VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                                  VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+                                  NULL,
+                                  (ctx->message_bits + ctx->parity_bits)*ctx->parity_bits*4,
+                                  VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    if (err < 0) {
+        printf("Error allocating memory: %s\n", av_err2str(err));
+        return err;
+    }
+    FFVkBuffer *dec_vk = (FFVkBuffer *)dec_ref->data;
+
     FFVkExecContext *exec = ff_vk_exec_get(&ctx->exec_pool);
     ff_vk_exec_start(&ctx->s, exec);
 
@@ -323,9 +341,16 @@ static int run_ec_shader(MainContext *ctx, ShaderContext *sc, int num_err)
         return err;
     }
 
+    err = ff_vk_exec_add_dep_buf(&ctx->s, exec, &dec_ref, 1, 0);
+    if (err < 0) {
+        printf("Error adding buffer dep: %s\n", av_err2str(err));
+        return err;
+    }
+
     ECShaderPush pd = {
         .mat = mat_vk->address,
         .msg = msg_vk->address,
+        .dec = dec_vk->address,
         .rand_seed = random(),
         .num_err = num_err,
         .bp_iter = 1,
@@ -428,6 +453,7 @@ int main(void)
     ctx.spv->uninit(&ctx.spv);
 
     av_buffer_pool_uninit(&sc.msg_pool);
+    av_buffer_pool_uninit(&sc.dec_pool);
     ff_vk_pipeline_free(&ctx.s, &sc.pl);
     ff_vk_shader_free(&ctx.s, &sc.shd);
 
