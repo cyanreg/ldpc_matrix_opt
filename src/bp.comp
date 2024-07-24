@@ -16,7 +16,12 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
-void bp_decode(OctetBuffer pkt, MatrixBuffer H)
+void init_var_to_chk()
+{
+
+}
+
+void bp_decode(OctetBuffer pkt)
 {
     /* Flooding-based decoder */
     for (int i = 0; i < bp_iter; i++) {

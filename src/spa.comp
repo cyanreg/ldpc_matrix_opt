@@ -18,7 +18,10 @@
 
 void update_begin(int ite)
 {
-    coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> m;
+#if 0
+    coopmat<float16_t, gl_ScopeInvocation, 16, 16, gl_MatrixUseA> m;
     float16_t test[16];
+    test[0] = float16_t(0.0);
     coopMatStore(m, test, 0, 16, gl_CooperativeMatrixLayoutRowMajor);
+#endif
 }

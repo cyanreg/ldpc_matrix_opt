@@ -41,14 +41,14 @@ void fill_buffer(OctetBuffer pkt)
     }
 }
 
-void ldpc_encode(OctetBuffer pkt, MatrixBuffer H)
+void ldpc_encode(OctetBuffer pkt)
 {
     int i, j, k;
+    int mat_cnt = 0;
     uint64_t parity, data, bits[8];
 
     /* Parity data goes last */
     uint64_t dst = uint64_t(pkt) + (message_bits >> 3);
-    uint64_t src = uint64_t(H);
 
     for (i = 0; i < (parity_bits >> 6); i++) {
         parity = 0x0;
@@ -60,8 +60,8 @@ void ldpc_encode(OctetBuffer pkt, MatrixBuffer H)
                 bits[k] = bool((data >> (7 - k)) & 1) ? ~0 : 0;
 
             for (k = 0; k < 8; k++) {
-                parity ^= bits[k] & (MatrixBuffer(src).v[0]);
-                src += 8;
+                uint64_t src = h_mat[0];
+                parity ^= bits[k] & src;
             }
         }
 
@@ -70,7 +70,7 @@ void ldpc_encode(OctetBuffer pkt, MatrixBuffer H)
             dst += 1;
         }
 
-        src += parity_bits;
+//        mat_cnt += parity_bits >> 6;
     }
 }
 
