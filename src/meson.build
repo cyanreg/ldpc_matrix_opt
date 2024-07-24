@@ -32,7 +32,11 @@ liblmo_sources = [
 ]
 
 glslang_dep = dependency('', required: false)
-shaderc_dep = dependency('shaderc', required: false)
+shaderc_dep = dependency('', required: false)
+
+if get_option('glsl') == 'shaderc'
+    shaderc_dep = dependency('shaderc', required: false)
+endif
 if shaderc_dep.found() == false
     glslang_dep = dependency('glslang', required: true)
 endif

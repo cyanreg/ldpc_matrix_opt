@@ -49,27 +49,32 @@ static int shdc_shader_compile(FFVkSPIRVCompiler *ctx, void *avctx,
         return AVERROR(ENOMEM);
 
     shaderc_compile_options_set_target_env(opts, shaderc_target_env_vulkan,
-                                           shaderc_env_version_vulkan_1_2);
-    shaderc_compile_options_set_target_spirv(opts, shaderc_spirv_version_1_5);
+                                           shaderc_env_version_vulkan_1_3);
+    shaderc_compile_options_set_target_spirv(opts, shaderc_spirv_version_1_6);
+    shaderc_compile_options_set_generate_debug_info(opts);
     shaderc_compile_options_set_optimization_level(opts,
-                                                   shaderc_optimization_level_performance);
+                                                   shaderc_optimization_level_zero);
 
     res = shaderc_compile_into_spv((shaderc_compiler_t)ctx->priv,
                                    shd->src.str, strlen(shd->src.str),
                                    shdc_kind[shd->shader.stage],
                                    shd->name, entrypoint, opts);
-    shaderc_compile_options_release(opts);
+    shaderc_compile_options_release(opts);;
 
     ret = shaderc_result_get_compilation_status(res);
     err = shaderc_result_get_num_errors(res);
     warn = shaderc_result_get_num_warnings(res);
     message = shaderc_result_get_error_message(res);
 
+    if (ret != shaderc_compilation_status_success && !err)
+        err = 1;
+
     loglevel = err ? AV_LOG_ERROR : warn ? AV_LOG_WARNING : AV_LOG_VERBOSE;
 
     ff_vk_shader_print(avctx, shd, loglevel);
     if (message && (err || warn))
         av_log(avctx, loglevel, "%s\n", message);
+
     status = ret < FF_ARRAY_ELEMS(shdc_result) ? shdc_result[ret] : "unknown";
     av_log(avctx, loglevel, "shaderc compile status '%s' (%d errors, %d warnings)\n",
            status, err, warn);
